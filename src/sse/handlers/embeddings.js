@@ -13,6 +13,7 @@ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { saveRequestUsage } from "@/lib/usageDb.js";
+import { checkProviderCircuit, recordProviderSuccess, recordProviderFailure } from "../services/circuitBreaker.js";
 
 function exactEmbeddingUsage(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || raw.estimated === true) return null;
@@ -89,6 +90,12 @@ export async function handleEmbeddings(request) {
     log.info("ROUTING", `Provider: ${provider}, Model: ${model}`);
   }
 
+  // Circuit breaker gate
+  if (checkProviderCircuit(provider).blocked) {
+    log.warn("EMBEDDINGS", `Circuit open for ${provider}, rejecting early`);
+    return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, `Provider ${provider} temporarily unavailable`);
+  }
+
   // Credential + fallback loop (mirrors handleChat)
   const excludeConnectionIds = new Set();
   let lastError = null;
@@ -131,6 +138,7 @@ export async function handleEmbeddings(request) {
       },
       onRequestSuccess: async () => {
         await clearAccountError(credentials.connectionId, credentials, model);
+        recordProviderSuccess(provider);
       }
     });
 
@@ -154,6 +162,7 @@ export async function handleEmbeddings(request) {
 
     if (shouldFallback) {
       log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);
+      recordProviderFailure(provider);
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error;
       lastStatus = result.status;

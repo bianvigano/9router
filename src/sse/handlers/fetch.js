@@ -12,8 +12,9 @@ import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
-import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
+import { handleComboChat, getComboModelsFromData, resolveComboStrategy, buildComboCtx } from "open-sse/services/combo.js";
 import { assertPublicUrl } from "@/shared/utils/ssrfGuard.js";
+import { checkProviderCircuit, recordProviderSuccess, recordProviderFailure } from "../services/circuitBreaker.js";
 
 /**
  * Handle web fetch (URL extraction) request for the SSE/Next.js server.
@@ -91,9 +92,9 @@ export async function handleFetch(request) {
   const combos = await getCombos();
   const comboModels = getComboModelsFromData(providerInput, combos);
   if (comboModels) {
-    const comboStrategies = settings.comboStrategies || {};
-    const comboStrategy = comboStrategies[providerInput]?.fallbackStrategy || settings.comboStrategy || "fallback";
+    const { strategy: comboStrategy, comboCfg } = resolveComboStrategy(settings, providerInput);
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
+    const comboCtx = buildComboCtx({ models: comboModels, comboCfg, body });
     log.info("FETCH", `Combo "${providerInput}" with ${comboModels.length} providers (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
     return handleComboChat({
       body,
@@ -102,7 +103,8 @@ export async function handleFetch(request) {
       log,
       comboName: providerInput,
       comboStrategy,
-      comboStickyLimit
+      comboStickyLimit,
+      comboCtx,
     });
   }
 
@@ -153,6 +155,12 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
     return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "Fetch failed");
   }
 
+  // Circuit breaker gate
+  if (checkProviderCircuit(providerId).blocked) {
+    log.warn("FETCH", `Circuit open for ${providerId}, rejecting early`);
+    return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, `Provider ${providerId} temporarily unavailable`);
+  }
+
   // Credential + fallback loop
   const excludeConnectionIds = new Set();
   let lastError = null;
@@ -200,6 +208,7 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
 
     if (result.success) {
       await clearAccountError(credentials.connectionId, credentials);
+      recordProviderSuccess(providerId);
       return new Response(JSON.stringify(result.data), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
@@ -209,6 +218,7 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
 
     if (shouldFallback) {
       log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);
+      recordProviderFailure(providerId);
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error;
       lastStatus = result.status;

@@ -11,7 +11,8 @@ import { handleImageGenerationCore } from "open-sse/handlers/imageGenerationCore
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
-import { handleComboChat } from "open-sse/services/combo.js";
+import { handleComboChat, resolveComboStrategy, buildComboCtx } from "open-sse/services/combo.js";
+import { checkProviderCircuit, recordProviderSuccess, recordProviderFailure } from "../services/circuitBreaker.js";
 import * as log from "../utils/logger.js";
 
 // Providers that don't require credentials (noAuth)
@@ -49,9 +50,9 @@ export async function handleImageGeneration(request) {
   // Combo expansion: model may be a combo name → run fallback/round-robin across models
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
-    const comboStrategies = settings.comboStrategies || {};
-    const comboStrategy = comboStrategies[modelStr]?.fallbackStrategy || settings.comboStrategy || "fallback";
+    const { strategy: comboStrategy, comboCfg } = resolveComboStrategy(settings, modelStr);
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
+    const comboCtx = buildComboCtx({ models: comboModels, comboCfg, body });
     log.info("IMAGE", `Combo "${modelStr}" with ${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
     return handleComboChat({
       body,
@@ -61,6 +62,7 @@ export async function handleImageGeneration(request) {
       comboName: modelStr,
       comboStrategy,
       comboStickyLimit,
+      comboCtx,
     });
   }
 
@@ -83,6 +85,12 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
     });
     if (result.success) return result.response;
     return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "Image generation failed");
+  }
+
+  // Circuit breaker gate
+  if (checkProviderCircuit(provider).blocked) {
+    log.warn("IMAGE", `Circuit open for ${provider}, rejecting early`);
+    return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, `Provider ${provider} temporarily unavailable`);
   }
 
   // Credentialed providers — fallback loop
@@ -123,6 +131,7 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
       },
       onRequestSuccess: async () => {
         await clearAccountError(credentials.connectionId, credentials, model);
+        recordProviderSuccess(provider);
       }
     });
 
@@ -131,6 +140,7 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model);
 
     if (shouldFallback) {
+      recordProviderFailure(provider);
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error;
       lastStatus = result.status;

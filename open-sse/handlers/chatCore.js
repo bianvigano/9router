@@ -38,7 +38,7 @@ import { resolveSessionId } from "../utils/sessionManager.js";
  * @param {object} options.credentials - Provider credentials
  * @param {string} options.sourceFormatOverride - Override detected source format (e.g. "openai-responses")
  */
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, stackedLabel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
@@ -216,13 +216,14 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Caveman: inject terse-style system prompt
   if (tokenSaverEnabled && cavemanEnabled && cavemanLevel) {
     injectCaveman(translatedBody, finalFormat, cavemanLevel);
-    xf.push(`CAVEMAN:${cavemanLevel}`);
+    // When stacked preset is active, skip individual label — covered by STACKED: label below.
+    if (!stackedLabel) xf.push(`CAVEMAN:${cavemanLevel}`);
   }
 
   // Ponytail: inject lazy-senior-dev system prompt
   if (tokenSaverEnabled && ponytailEnabled && ponytailLevel) {
     injectPonytail(translatedBody, finalFormat, ponytailLevel);
-    xf.push(`PONYTAIL:${ponytailLevel}`);
+    if (!stackedLabel) xf.push(`PONYTAIL:${ponytailLevel}`);
   }
 
   // PXPIPE: image bulky context (Claude-format bodies only), last saver before dispatch
@@ -238,7 +239,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     try { onPxpipeEvent?.({ provider, model, ...pxpipeSummary }); } catch { /* stats must not break requests */ }
   }
 
-  if (xf.length && log?.line) log.line(reqTag, "⚙", xf.join(" · "));
+  if (xf.length && log?.line) {
+    // When stacked is active, prepend the stacked label before individual flags
+    const parts = stackedLabel ? [`STACKED:${stackedLabel}`, ...xf] : xf;
+    log.line(reqTag, "⚙", parts.join(" · "));
+  }
 
   const executor = getExecutor(provider);
   trackPendingRequest(model, provider, connectionId, true);

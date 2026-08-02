@@ -15,13 +15,15 @@ import { DEFAULT_HEADROOM_URL } from "@/lib/headroom/detect";
 import { getTransform as getPxpipeTransform } from "@/lib/pxpipe/loader.js";
 import { appendPxpipeEvent } from "@/lib/pxpipe/events.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
-import { handleComboChat, handleFusionChat } from "open-sse/services/combo.js";
+import { handleComboChat, handleFusionChat, resolveComboStrategy, buildComboCtx } from "open-sse/services/combo.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
+import { resolveStackedCompression } from "open-sse/rtk/stacked.js";
+import { checkProviderCircuit, recordProviderSuccess, recordProviderFailure } from "../services/circuitBreaker.js";
 
 /**
  * Handle chat completion request
@@ -89,10 +91,7 @@ export async function handleChat(request, clientRawRequest = null) {
   // Check if model is a combo (has multiple models with fallback)
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
-    // Check for combo-specific strategy first, fallback to global
-    const comboStrategies = settings.comboStrategies || {};
-    const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
-    const comboStrategy = comboSpecificStrategy || settings.comboStrategy || "fallback";
+    const { strategy: comboStrategy, comboCfg } = resolveComboStrategy(settings, modelStr);
 
     if (comboStrategy === "fusion") {
       log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
@@ -109,12 +108,13 @@ export async function handleChat(request, clientRawRequest = null) {
         },
         log,
         comboName: modelStr,
-        judgeModel: comboStrategies[modelStr]?.judgeModel,
-        tuning: comboStrategies[modelStr]?.fusionTuning,
+        judgeModel: comboCfg.judgeModel,
+        tuning: comboCfg.fusionTuning,
       });
     }
 
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
+    const comboCtx = buildComboCtx({ models: comboModels, comboCfg, body });
     log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
     return handleComboChat({
       body,
@@ -123,7 +123,8 @@ export async function handleChat(request, clientRawRequest = null) {
       log,
       comboName: modelStr,
       comboStrategy,
-      comboStickyLimit
+      comboStickyLimit,
+      comboCtx,
     });
   }
 
@@ -143,9 +144,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     if (comboModels) {
       const chatSettings = await getSettings();
       // Check for combo-specific strategy first, fallback to global
-      const comboStrategies = chatSettings.comboStrategies || {};
-      const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
-      const comboStrategy = comboSpecificStrategy || chatSettings.comboStrategy || "fallback";
+      const { strategy: comboStrategy, comboCfg } = resolveComboStrategy(chatSettings, modelStr);
 
       if (comboStrategy === "fusion") {
         log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
@@ -162,12 +161,13 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
           },
           log,
           comboName: modelStr,
-          judgeModel: comboStrategies[modelStr]?.judgeModel,
-          tuning: comboStrategies[modelStr]?.fusionTuning,
+          judgeModel: comboCfg.judgeModel,
+          tuning: comboCfg.fusionTuning,
         });
       }
 
       const comboStickyLimit = chatSettings.comboStickyRoundRobinLimit;
+      const comboCtx = buildComboCtx({ models: comboModels, comboCfg, body });
       log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
       return handleComboChat({
         body,
@@ -176,7 +176,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         log,
         comboName: modelStr,
         comboStrategy,
-        comboStickyLimit
+        comboStickyLimit,
+        comboCtx,
       });
     }
     log.warn("CHAT", "Invalid model format", { model: modelStr });
@@ -184,6 +185,16 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   }
 
   const { provider, model } = modelInfo;
+
+  // Circuit breaker gate — reject early if provider circuit is OPEN
+  const chatSettings = await getSettings();
+  if (chatSettings.circuitBreakerEnabled !== false) {
+    const breaker = checkProviderCircuit(provider);
+    if (breaker.blocked) {
+      log.warn("CHAT", `Circuit open for ${provider}, rejecting early`);
+      return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, breaker.reason || `Provider ${provider} temporarily unavailable`);
+    }
+  }
 
   // Routing shown in the unified "▶" line (client model → provider/model)
 
@@ -229,6 +240,19 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Use shared chatCore
     const chatSettings = await getSettings();
+    const stacked = resolveStackedCompression({
+      stackedCompression: chatSettings.stackedCompression || "off",
+      rtkEnabled: chatSettings.rtkEnabled,
+      cavemanEnabled: chatSettings.cavemanEnabled,
+      cavemanLevel: chatSettings.cavemanLevel,
+      ponytailEnabled: chatSettings.ponytailEnabled,
+      ponytailLevel: chatSettings.ponytailLevel,
+      hasOldSettings: {
+        rtk: "rtkEnabled" in chatSettings,
+        caveman: "cavemanEnabled" in chatSettings,
+        ponytail: "ponytailEnabled" in chatSettings,
+      },
+    });
     const providerThinking = (chatSettings.providerThinking || {})[provider] || null;
     const result = await handleChatCore({
       body: { ...body, model: `${provider}/${model}` },
@@ -240,14 +264,15 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       userAgent,
       apiKey,
       ccFilterNaming: !!chatSettings.ccFilterNaming,
-      rtkEnabled: !!chatSettings.rtkEnabled,
+      rtkEnabled: stacked.effectiveRtk,
       headroomEnabled: !!chatSettings.headroomEnabled,
       headroomUrl: chatSettings.headroomUrl || DEFAULT_HEADROOM_URL,
       headroomCompressUserMessages: !!chatSettings.headroomCompressUserMessages,
-      cavemanEnabled: !!chatSettings.cavemanEnabled,
-      cavemanLevel: chatSettings.cavemanLevel || "full",
-      ponytailEnabled: !!chatSettings.ponytailEnabled,
-      ponytailLevel: chatSettings.ponytailLevel || "full",
+      cavemanEnabled: stacked.effectiveCavemanEnabled,
+      cavemanLevel: stacked.effectiveCavemanLevel,
+      ponytailEnabled: stacked.effectivePonytailEnabled,
+      ponytailLevel: stacked.effectivePonytailLevel,
+      stackedLabel: stacked.stackedLabel,
       pxpipeEnabled: !!chatSettings.pxpipeEnabled,
       pxpipeMinChars: chatSettings.pxpipeMinChars,
       pxpipeTimeoutMs: chatSettings.pxpipeTimeoutMs,
@@ -266,6 +291,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       },
       onRequestSuccess: async () => {
         await clearAccountError(credentials.connectionId, credentials, model);
+        recordProviderSuccess(provider);
       }
     });
 
@@ -276,6 +302,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     if (shouldFallback) {
       log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} UNAVAILABLE (${result.status}) → NEXT ACCOUNT`);
+      recordProviderFailure(provider);
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error;
       lastStatus = result.status;

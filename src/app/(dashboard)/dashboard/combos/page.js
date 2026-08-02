@@ -108,14 +108,23 @@ export default function CombosPage() {
     });
   };
 
-  // Merge a per-combo strategy patch into settings.comboStrategies. Passing an empty
-  // patch (strategy back to default "fallback") drops the entry entirely.
+  // Merge a per-combo strategy patch into settings.comboStrategies.
+  // Pass `{ strategy, fallbackStrategy, weights, judgeModel, fusionTuning }`.
+  // Prune only when nothing meaningful remains.
   const handleSetComboStrategy = async (comboName, patch) => {
     try {
       const updated = { ...comboStrategies };
       const next = { ...(updated[comboName] || {}), ...patch };
-      // Prune to keep settings clean: default fallback with no extras = no entry.
-      if (!next.fallbackStrategy || next.fallbackStrategy === "fallback") {
+
+      if (patch.clearModernStrategy) delete next.strategy;
+      if (patch.clearFallbackStrategy) delete next.fallbackStrategy;
+
+      const hasModern = typeof next.strategy === "string" && next.strategy.trim();
+      const hasLegacy = next.fallbackStrategy && next.fallbackStrategy !== "fallback";
+      const hasExtras = !!next.judgeModel || !!next.fusionTuning
+        || (next.weights && Object.keys(next.weights).length > 0);
+
+      if (!hasModern && !hasLegacy && !hasExtras) {
         delete updated[comboName];
       } else {
         updated[comboName] = next;
@@ -230,17 +239,56 @@ export default function CombosPage() {
   );
 }
 
-const STRATEGY_OPTIONS = [
+const LEGACY_OPTIONS = [
   { value: "fallback", label: "Fallback — try in order" },
   { value: "round-robin", label: "Round Robin — rotate" },
   { value: "fusion", label: "Fusion — panel + judge" },
 ];
 
+const ADVANCED_OPTIONS = [
+  { value: "priority", label: "Priority — stored order" },
+  { value: "fill-first", label: "Fill First — drain quota" },
+  { value: "weighted", label: "Weighted — configured weights" },
+  { value: "p2c", label: "Power of Two — lower load" },
+  { value: "least-used", label: "Least Used" },
+  { value: "random", label: "Random" },
+  { value: "strict-random", label: "Strict Random" },
+  { value: "cost-optimized", label: "Cost Optimized" },
+  { value: "headroom", label: "Headroom — healthy first" },
+  { value: "reset-window", label: "Reset Window" },
+  { value: "reset-aware", label: "Reset Aware" },
+  { value: "context-optimized", label: "Context Optimized" },
+  { value: "cache-optimized", label: "Cache Optimized" },
+  { value: "lkgp", label: "Last Known Good" },
+  { value: "auto", label: "Auto — cost + health" },
+  { value: "context-relay", label: "Context Relay" },
+];
+
+const LEGACY_VALUES = new Set(LEGACY_OPTIONS.map((o) => o.value));
+
 function ComboCard({ combo, getCaps, activeProviders = [], copied, onCopy, onEdit, onDelete, strategy = {}, onSetStrategy }) {
   const [showJudgeSelect, setShowJudgeSelect] = useState(false);
-  const current = strategy.fallbackStrategy || "fallback";
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const current = strategy.strategy || strategy.fallbackStrategy || "fallback";
+  const isAdvanced = !LEGACY_VALUES.has(current);
   const judge = strategy.judgeModel || "";
   const isFusion = current === "fusion";
+  const effectiveWeights = strategy.weights || {};
+
+  const handleStrategyChange = (value) => {
+    if (LEGACY_VALUES.has(value)) {
+      onSetStrategy({
+        strategy: undefined,
+        clearModernStrategy: true,
+        fallbackStrategy: value,
+      });
+    } else {
+      onSetStrategy({
+        strategy: value,
+        clearFallbackStrategy: true,
+      });
+    }
+  };
 
   return (
     <Card padding="sm" className="group">
@@ -294,15 +342,82 @@ function ComboCard({ combo, getCaps, activeProviders = [], copied, onCopy, onEdi
 
         {/* Actions */}
         <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center sm:gap-3 sm:shrink-0">
-          {/* Strategy selector — always visible */}
-          <div className="w-full sm:w-[200px]">
+          {/* Strategy selector */}
+          <div className="w-full sm:w-[220px]">
             <Select
-              options={STRATEGY_OPTIONS}
+              options={[
+                ...LEGACY_OPTIONS,
+                ...(isAdvanced
+                  ? [{ value: current, label: `Advanced — ${current}` }]
+                  : []),
+              ]}
               value={current}
-              onChange={(e) => onSetStrategy({ fallbackStrategy: e.target.value })}
+              onChange={(e) => handleStrategyChange(e.target.value)}
               selectClassName="py-1.5 text-xs"
             />
+            <button
+              type="button"
+              onClick={() => setShowAdvanced(!showAdvanced)}
+              className="mt-1 flex items-center gap-1 text-[11px] text-text-muted hover:text-primary transition-colors"
+            >
+              <span className="material-symbols-outlined text-[13px]">
+                {showAdvanced ? "expand_less" : "tune"}
+              </span>
+              {showAdvanced ? "Hide advanced" : "Advanced strategies"}
+            </button>
           </div>
+
+          {/* Advanced strategy panel */}
+          {showAdvanced && (
+            <div className="w-full mt-1 rounded-lg border border-border p-2">
+              <p className="mb-1 text-[11px] font-medium text-text-muted">
+                Advanced strategy
+              </p>
+              <Select
+                options={ADVANCED_OPTIONS}
+                value={isAdvanced ? current : "priority"}
+                onChange={(e) => handleStrategyChange(e.target.value)}
+                selectClassName="py-1.5 text-xs"
+              />
+
+              {current === "weighted" && combo.models.length > 0 && (
+                <div className="mt-2 flex flex-col gap-1">
+                  <p className="text-[10px] font-medium text-text-muted">
+                    Weights (higher = preferred)
+                  </p>
+                  {combo.models.map((model) => (
+                    <label
+                      key={model}
+                      className="flex items-center gap-2 text-xs"
+                    >
+                      <code className="min-w-0 flex-1 truncate font-mono">
+                        {model}
+                      </code>
+                      <Input
+                        type="number"
+                        min="0"
+                        step="0.1"
+                        value={
+                          effectiveWeights[model] !== undefined
+                            ? effectiveWeights[model]
+                            : ""
+                        }
+                        onChange={(e) => {
+                          const v = parseFloat(e.target.value);
+                          const next = { ...effectiveWeights };
+                          if (isNaN(v) || v < 0) delete next[model];
+                          else next[model] = v;
+                          onSetStrategy({ weights: next });
+                        }}
+                        placeholder="1"
+                        className="w-16 text-center shrink-0"
+                      />
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="grid grid-cols-3 gap-1 sm:flex">
             <button

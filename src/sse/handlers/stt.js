@@ -9,6 +9,7 @@ import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
 import * as log from "../utils/logger.js";
+import { checkProviderCircuit, recordProviderSuccess, recordProviderFailure } from "../services/circuitBreaker.js";
 
 // Providers requiring credentials for STT
 const CREDENTIALED_PROVIDERS = new Set(
@@ -52,6 +53,12 @@ export async function handleStt(request) {
     return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "STT failed");
   }
 
+  // Circuit breaker gate
+  if (checkProviderCircuit(provider).blocked) {
+    log.warn("STT", `Circuit open for ${provider}, rejecting early`);
+    return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, `Provider ${provider} temporarily unavailable`);
+  }
+
   // Credentialed — fallback loop
   const excludeConnectionIds = new Set();
   let lastError = null;
@@ -74,10 +81,14 @@ export async function handleStt(request) {
 
     const result = await handleSttCore({ provider, model, formData, credentials, sttConfig: AI_PROVIDERS[provider]?.sttConfig });
 
-    if (result.success) return result.response;
+    if (result.success) {
+      recordProviderSuccess(provider);
+      return result.response;
+    }
 
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model);
     if (shouldFallback) {
+      recordProviderFailure(provider);
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error;
       lastStatus = result.status;

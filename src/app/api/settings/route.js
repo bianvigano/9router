@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getSettings, updateSettings } from "@/lib/localDb";
 import { applyOutboundProxyEnv } from "@/lib/network/outboundProxy";
 import { resetComboRotation } from "open-sse/services/combo.js";
+import { resetStrategyState } from "open-sse/services/strategies.js";
 import bcrypt from "bcryptjs";
 
 export const dynamic = "force-dynamic";
@@ -94,6 +95,7 @@ export async function PATCH(request) {
       Object.prototype.hasOwnProperty.call(body, "comboStrategies")
     ) {
       resetComboRotation();
+      resetStrategyState();
     }
 
     if (

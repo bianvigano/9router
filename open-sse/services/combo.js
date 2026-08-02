@@ -5,7 +5,16 @@
 import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
+import { getPricingForModel } from "../providers/pricing.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
+import {
+  computeModels,
+  recordComboSuccess,
+  selectStrategy,
+  strategyState,
+  STRATEGIES,
+} from "./strategies.js";
+import { normalizeStickyLimit } from "./strategiesState.js";
 
 // Hard capabilities = input modalities; missing one drops request data (e.g. image
 // stripped). Must be prioritized. Soft (e.g. search) only degrades a feature.
@@ -82,10 +91,13 @@ export function reorderByCapabilities(models, required) {
 }
 
 /**
- * Track rotation state per combo (for round-robin strategy)
+ * Track rotation state per combo (for round-robin strategy).
  * @type {Map<string, { index: number, consecutiveUseCount: number }>}
+ * Legacy — canonical state lives in strategies.js#strategyState. The wrapper
+ * keeps both names pointing at the same Map so existing callers (incl. tests)
+ * continue to read/write the same state without DB changes.
  */
-const comboRotationState = new Map();
+const comboRotationState = strategyState.rotation;
 
 // Trailing run of items after the last assistant/model turn = the current user
 // turn. It may span several messages (e.g. text + image split across blocks),
@@ -132,14 +144,14 @@ export function detectRequiredCapabilities(body) {
   return required;
 }
 
-function normalizeStickyLimit(stickyLimit) {
-  const parsed = Number.parseInt(stickyLimit, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
-}
-
 function rotateModelsFromIndex(models, currentIndex) {
+  // Retained for source-compat with the original `getRotatedModels` rotation
+  // algorithm — superseded by strategies.js#roundRobinSelect but kept around
+  // for any test/internal call site that still references it.
   const rotatedModels = [...models];
   for (let i = 0; i < currentIndex; i++) {
+    const rotatedModelsLen = rotatedModels.length;
+    if (rotatedModelsLen === 0) break;
     const moved = rotatedModels.shift();
     rotatedModels.push(moved);
   }
@@ -147,46 +159,64 @@ function rotateModelsFromIndex(models, currentIndex) {
 }
 
 /**
- * Get rotated model list based on strategy
+ *
+ * Thin backward-compat wrapper around `computeModels` in strategies.js.
+ * The original signature `(models, comboName, strategy, stickyLimit)` is
+ * preserved so the seven legacy callers still work without changes. The
+ * behavior on the legacy names is **identical** to before this refactor —
+ * see `tests/unit/combo-rotation.test.js` for the contract.
+ *
+ * Strategy names accepted:
+ *   - legacy  "fallback"  → normalized to "priority" (identity reorder, drains list)
+ *   - legacy  "round-robin" → round-robin with stickyLimit (unchanged behavior)
+ *   - 17 new names from strategies.js (priority, fill-first, weighted, p2c,
+ *     least-used, random, strict-random, cost-optimized, headroom,
+ *     reset-window, reset-aware, context-optimized, cache-optimized, lkgp,
+ *     auto, context-relay, pipeline).
+ *
  * @param {string[]} models - Array of model strings
- * @param {string} comboName - Name of the combo
- * @param {string} strategy - "fallback" or "round-robin"
- * @param {number|string} [stickyLimit=1] - Requests per combo model before switching
- * @returns {string[]} Rotated models array
+ * @param {string} comboName - Name of the combo (state key)
+ * @param {string} strategy - Legacy or new strategy name
+ * @param {number|string} [stickyLimit=1] - Requests per combo model before
+ *   advancing the round-robin pointer. Ignored for non-rotation strategies.
+ * @returns {string[]} Reordered model list (may be a fresh copy even when the
+ *   strategy is identity, so callers may mutate freely).
  */
-export function getRotatedModels(models, comboName, strategy, stickyLimit = 1) {
-  if (!models || models.length <= 1 || strategy !== "round-robin") {
-    return models;
+export function getRotatedModels(models, comboName, strategy, stickyLimit = 1, comboCtx = {}) {
+  if (!Array.isArray(models) || models.length === 0) return models || [];
+  if (models.length <= 1) return models.slice();
+  // Identify unknown strategy names (incl. typos) so we can warn once.
+  const normalized = strategy === "fallback" ? "priority" : strategy;
+  if (strategy && normalized !== "round-robin" && !STRATEGIES[normalized] && normalized !== strategy) {
+    // Unknown legacy alias — keep legacy identity behavior.
+    return models.slice();
   }
-
-  const rotationKey = comboName || "__default__";
-  const normalizedStickyLimit = normalizeStickyLimit(stickyLimit);
-  const existingState = comboRotationState.get(rotationKey);
-  const state = typeof existingState === "number"
-    ? { index: existingState, consecutiveUseCount: 0 }
-    : (existingState || { index: 0, consecutiveUseCount: 0 });
-
-  const currentIndex = state.index % models.length;
-  const rotatedModels = rotateModelsFromIndex(models, currentIndex);
-  const nextUseCount = state.consecutiveUseCount + 1;
-
-  if (nextUseCount >= normalizedStickyLimit) {
-    comboRotationState.set(rotationKey, {
-      index: (currentIndex + 1) % models.length,
-      consecutiveUseCount: 0,
-    });
-  } else {
-    comboRotationState.set(rotationKey, {
-      index: currentIndex,
-      consecutiveUseCount: nextUseCount,
-    });
+  if (!STRATEGIES[normalized]) {
+    // Unknown strategy: return originals rather than throw — match the
+    // previous "fallback" path which returned models verbatim.
+    return models.slice();
   }
-
-  return rotatedModels;
+  const mergedCtx = {
+    comboName: comboCtx.comboName ?? comboName,
+    rotationState: comboCtx.rotationState ?? comboRotationState,
+    stickyLimit: comboCtx.stickyLimit ?? normalizeStickyLimit(stickyLimit),
+    pricing: comboCtx.pricing,
+    capabilities: comboCtx.capabilities,
+    cooldowns: comboCtx.cooldowns,
+    contextTokens: comboCtx.contextTokens,
+    weights: comboCtx.weights,
+    seed: comboCtx.seed,
+  };
+  return computeModels({
+    strategy: normalized,
+    models,
+    comboName,
+    ctx: mergedCtx,
+  });
 }
 
 /**
- * Reset in-memory rotation state when combo/settings change
+ * Reset in-memory rotation state when combo/settings change.
  * @param {string} [comboName] - Combo name to reset; omit to clear all
  */
 export function resetComboRotation(comboName) {
@@ -214,6 +244,112 @@ export function getComboModelsFromData(modelStr, combosData) {
   return null;
 }
 
+// ============================================================
+// Strategy resolution & runtime context
+// ============================================================
+
+/**
+ * Resolve the effective strategy name for a combo.
+ *
+ * Precedence (additive, non-breaking):
+ *   1. comboCfg.strategy  (modern field — any of 19 names)
+ *   2. comboCfg.fallbackStrategy  (legacy — "fallback"|"round-robin"|"fusion")
+ *   3. settings.comboStrategy  (global toggle)
+ *   4. "fallback"  (default)
+ *
+ * @param {object} settings   - `getSettings()` result
+ * @param {string} comboName  - combo name
+ * @returns {{ strategy: string, comboCfg: object }}
+ */
+export function resolveComboStrategy(settings = {}, comboName) {
+  const raw = (settings.comboStrategies || {})[comboName];
+  const comboCfg = raw && typeof raw === "object" ? raw : {};
+  const strategy = comboCfg.strategy
+    || comboCfg.fallbackStrategy
+    || settings.comboStrategy
+    || "fallback";
+  return { strategy, comboCfg };
+}
+
+const MEDIA_KEYS = new Set([
+  "url", "image_url", "data", "base64", "inlineData", "fileData",
+]);
+
+function countTextChars(value, key = "") {
+  if (value == null) return 0;
+  if (typeof value === "string") return MEDIA_KEYS.has(key) ? 0 : value.length;
+  if (Array.isArray(value)) return value.reduce((s, v) => s + countTextChars(v), 0);
+  if (typeof value === "object") {
+    return Object.entries(value)
+      .reduce((s, [k, v]) => s + countTextChars(v, k), 0);
+  }
+  return 0;
+}
+
+/**
+ * Estimate token count from request body messages.
+ * Approximate: chars / 4 (English ~4 chars/token). Skips image/audio payloads.
+ * Returns 0 for empty/unrecognized shape — selectors fall back to identity.
+ */
+export function estimateMessageTokens(body) {
+  const source =
+    body?.messages || body?.input || body?.contents || body?.request?.contents || "";
+  const chars = countTextChars(source);
+  return chars > 0 ? Math.ceil(chars / 4) : 0;
+}
+
+/**
+ * Build the strategy ctx map for one combo invocation.
+ *
+ * Populated from static provider modules (zero I/O):
+ *   - pricing:   `getPricingForModel(provider, model)` → $/M-token map
+ *   - capabilities: `getCapabilitiesForModel(provider, model)` → vision/pdf/contextWindow map
+ *   - contextTokens: ~chars/4 from the request body messages
+ *   - weights:   from `comboCfg.weights` (new per-combo field)
+ *
+ * Models without a "/" in the name (custom nodes, aliases) are skipped for
+ * pricing/capabilities — selectors already fail-open for missing entries.
+ *
+ * @param {object}   opts
+ * @param {string[]} opts.models       — combo model list
+ * @param {object}   [opts.comboCfg]   — settings entry `comboStrategies[name]`
+ * @param {object}   [opts.body]       — request body (for token estimate)
+ * @returns {object} ctx map ready to merge into `computeModels`.
+ */
+export function buildComboCtx({ models, comboCfg = {}, body } = {}) {
+  const pricing = {};
+  const capabilities = {};
+
+  if (Array.isArray(models)) {
+    for (const fullModel of models) {
+      if (typeof fullModel !== "string") continue;
+      const slash = fullModel.indexOf("/");
+      if (slash <= 0) continue;
+      const provider = fullModel.slice(0, slash);
+      const model = fullModel.slice(slash + 1);
+      const price = getPricingForModel(provider, model);
+      const caps = getCapabilitiesForModel(provider, model);
+      if (price != null) pricing[fullModel] = price;
+      if (caps != null) capabilities[fullModel] = caps;
+    }
+  }
+
+  const weights = {};
+  if (comboCfg.weights && typeof comboCfg.weights === "object") {
+    for (const model of Array.isArray(models) ? models : []) {
+      const v = Number(comboCfg.weights[model]);
+      if (Number.isFinite(v) && v >= 0) weights[model] = v;
+    }
+  }
+
+  return {
+    pricing: Object.keys(pricing).length > 0 ? pricing : undefined,
+    capabilities: Object.keys(capabilities).length > 0 ? capabilities : undefined,
+    contextTokens: body ? estimateMessageTokens(body) : undefined,
+    weights: Object.keys(weights).length > 0 ? weights : undefined,
+  };
+}
+
 /**
  * Handle combo chat with fallback
  * @param {Object} options
@@ -226,9 +362,9 @@ export function getComboModelsFromData(modelStr, combosData) {
  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
  * @returns {Promise<Response>}
  */
-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true }) {
+export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, comboCtx = {}, autoSwitch = true }) {
   // Apply rotation strategy if enabled
-  let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
+  let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit, comboCtx);
 
   // Auto-switch: float models that satisfy the request's required capabilities to the front.
   if (autoSwitch) {
@@ -256,6 +392,9 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       // Success (2xx) - return response
       if (result.ok) {
         log.info("COMBO", `Model ${modelStr} succeeded`);
+        // Record success for lkgp/cache-optimized strategies. No-op for
+        // non-stateful strategies (cheap Map.set + no reads).
+        recordComboSuccess(comboName, modelStr);
         return result;
       }
 

@@ -12,6 +12,7 @@ import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import * as log from "../utils/logger.js";
+import { checkProviderCircuit, recordProviderSuccess, recordProviderFailure } from "../services/circuitBreaker.js";
 
 // Video generation is xAI-only today; requests without a provider prefix
 // (bare model id, or multipart bodies we deliberately don't parse) land here.
@@ -102,6 +103,12 @@ export async function handleVideoCreate(request, action) {
   if (resolved.error) return resolved.error;
   const { provider, model } = resolved;
 
+  // Circuit breaker gate
+  if (checkProviderCircuit(provider).blocked) {
+    log.warn("VIDEO", `Circuit open for ${provider}, rejecting early`);
+    return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, `Provider ${provider} temporarily unavailable`);
+  }
+
   // Strip the provider prefix (e.g. "xai/grok-imagine-video") before forwarding;
   // otherwise forward the original bytes untouched.
   let forwardBody = bodyInfo.raw;
@@ -154,16 +161,18 @@ export async function handleVideoCreate(request, action) {
 
     if (result.success) {
       await clearAccountError(credentials.connectionId, credentials, model);
+      recordProviderSuccess(provider);
       log.info("VIDEO", `${provider.toUpperCase()} | ${action} accepted (connection ${credentials.connectionId})`);
       return withConnectionHeader(result.response, credentials.connectionId);
     }
 
-    // Record the failure (dashboard shows lastError/errorCode → user sees re-auth is needed)
+    // Record the failure
     const { shouldFallback } = await markAccountUnavailable(
       credentials.connectionId, result.status, sanitizeSecrets(result.error, refreshedCredentials), provider, model
     );
 
     if (shouldFallback && CREATE_ROTATION_STATUSES.has(result.status)) {
+      recordProviderFailure(provider);
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error;
       lastStatus = result.status;
