@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { APP_CONFIG } from "@/shared/constants/config";
+import { useBranding } from "@/shared/components/BrandingContext";
 
 const footerLinks = {
   product: [
@@ -22,6 +23,7 @@ const footerLinks = {
 };
 
 export default function Footer() {
+  const { effectiveName } = useBranding();
   return (
     <footer className="bg-bg border-t border-border pt-16 pb-12">
       <div className="container mx-auto px-4 sm:px-6 lg:px-8">
@@ -39,7 +41,7 @@ export default function Footer() {
                 </svg>
               </div>
               <span className="text-xl font-bold text-text-main">
-                {APP_CONFIG.name}
+                {effectiveName}
               </span>
             </div>
             <p className="text-text-muted mb-6 max-w-sm font-light">
@@ -114,7 +116,7 @@ export default function Footer() {
         {/* Bottom */}
         <div className="border-t border-border pt-8 flex flex-col md:flex-row justify-between items-center gap-4">
           <p className="text-sm text-text-muted">
-            © {new Date().getFullYear()} {APP_CONFIG.name} Inc. All rights reserved.
+            © {new Date().getFullYear()} {effectiveName} Inc. All rights reserved.
           </p>
           <div className="flex gap-6 text-sm text-text-muted">
             <Link href="#" className="hover:text-primary transition-colors">
