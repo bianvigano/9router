@@ -1,6 +1,6 @@
 # 9Router — Full Feature Guide
 
-> **Version:** 9Router `v0.5.45` (2026-07-30)  
+> **Version:** 9Router `v0.5.55` (2026-08-14)  
 > **Scope:** A comprehensive guide to every major feature in 9Router, how it works, why it matters, and how to use it.  
 > **Audience:** Users, integrators, and contributors.
 
@@ -34,6 +34,14 @@
 24. [Security Model](#security-model)
 25. [Common Use Cases](#common-use-cases)
 26. [Cost Display vs. Real Billing](#cost-display-vs-real-billing)
+27. [SAML 2.0 SSO](#saml-20-sso)
+28. [Self-Hosted STT / TTS / Embedding](#self-hosted-stt--tts--embedding)
+29. [Fish Audio TTS](#fish-audio-tts)
+30. [Vision & Audio Capacity Adapter](#vision--audio-capacity-adapter)
+31. [TokenRouter Provider](#tokenrouter-provider)
+32. [Default Key Auto-Provisioning](#default-key-auto-provisioning)
+33. [New Providers & Models](#new-providers--models)
+34. [Claude Quota Cache](#claude-quota-cache)
 
 ---
 
@@ -127,10 +135,10 @@ Model:    kr/claude-sonnet-4.5
 | Codex | OpenAI Codex CLI |
 | GitHub Copilot | Copilot chat/completions |
 | Cursor | Cursor IDE native protocol |
-| Kimchi | OAuth provider |
+| Kimchi | OAuth **or API key** (dual auth, v0.5.55) |
 | Kiro | AWS Builder ID / Google / GitHub OAuth |
 | Gemini CLI | Native Gemini CLI auth |
-| Qwen | OAuth integration |
+| Qwen | ~~OAuth integration~~ removed in v0.5.50 (flow unreliable) |
 | Grok CLI | Device-code OAuth flow |
 | Zed / Trae / Windsurf | OAuth callback proxies |
 
@@ -138,7 +146,7 @@ Model:    kr/claude-sonnet-4.5
 
 | Provider | Models | Quota |
 |----------|--------|-------|
-| **Kiro AI** | Claude 4.5, GLM-5, MiniMax | ~50 credits/month free (500 trial credits for new accounts in first 30 days) |
+| **Kiro AI** | Claude 4.5/5, GLM-5, MiniMax | ~50 credits/month free (500 trial credits for new accounts in first 30 days) |
 | **OpenCode Free** | Auto-fetched model list | No auth, free tier varies over time |
 | **Vertex AI** | Gemini 3 Pro, GLM-5, DeepSeek | $300 free credits for new GCP accounts |
 
@@ -146,7 +154,7 @@ Model:    kr/claude-sonnet-4.5
 
 ### API Key Providers (40+)
 
-OpenAI, Anthropic, OpenRouter, GLM, Kimi, MiniMax, DeepSeek, Groq, xAI, Mistral, Perplexity, Together AI, Fireworks, Cerebras, Cohere, NVIDIA, SiliconFlow, Nebius, Chutes, Hyperbolic, Featherless, Poolside, and many more.
+OpenAI, Anthropic, OpenRouter, GLM, Kimi, MiniMax, DeepSeek, Groq, xAI, Mistral, Perplexity, Together AI, Fireworks, Cerebras, Cohere, NVIDIA, SiliconFlow, Nebius, Chutes, Hyperbolic, Featherless, Poolside, **TokenRouter** (300+ models), **Alibaba Token Plan** (SG-only), api-airforce, baidu, bazaarlink, bluesminds, kilo-gateway, llm7, morph, sambanova, tencent, **Self-hosted STT/TTS/Embedding**, and many more.
 
 ---
 
@@ -542,6 +550,266 @@ You only pay:
 
 ---
 
+## SAML 2.0 SSO
+
+Enterprise Single Sign-On via SAML 2.0 protocol (added in v0.5.55).
+
+### How It Works
+
+1. **AuthnRequest Generation**: 9Router generates SAML authentication requests.
+2. **ACS Assertion Handling**: Assertion Consumer Service validates SAML responses from IdP.
+3. **SP Metadata Export**: Download Service Provider metadata for IdP configuration.
+4. **Admin Config Test**: Test SAML configuration from dashboard before enabling.
+5. **Replay Protection**: Uses `saml_state` cookie matched against `InResponseTo` to prevent replay attacks.
+
+### Use Cases
+
+- Integrate 9Router with corporate identity providers (Okta, Azure AD, OneLogin, etc.)
+- Centralized authentication management
+- Automatic user provisioning from enterprise directory
+
+### Configuration
+
+Enable in Dashboard → Settings → Authentication → SAML SSO. Requires:
+- IdP metadata URL or XML
+- SP Entity ID
+- Assertion Consumer Service URL
+- Attribute mapping (email, name, etc.)
+
+---
+
+## Self-Hosted STT / TTS / Embedding
+
+Point 9Router at your own OpenAI-compatible speech and embedding servers (added in v0.5.50).
+
+### Supported Backends
+
+| Type | Examples |
+|------|----------|
+| **Speech-to-Text** | whisper.cpp, faster-whisper |
+| **Text-to-Speech** | Kokoro-FastAPI |
+| **Embeddings** | llama-server, vLLM, Infinity |
+
+### Benefits
+
+- **Privacy**: Keep sensitive data on-premises
+- **Cost**: No per-token charges for self-hosted models
+- **Latency**: Lower latency than cloud APIs
+- **Control**: Full control over model versions and configurations
+
+### Configuration
+
+Unlike named cloud providers, self-hosted providers read `baseUrl` per connection, so one provider can front several machines:
+
+```
+Provider: Self-hosted STT
+Base URL: http://whisper-server:9000/v1
+API Key: [optional]
+
+Provider: Self-hosted TTS
+Base URL: http://kokoro-server:8880/v1
+API Key: [optional]
+
+Provider: Self-hosted Embeddings
+Base URL: http://embedding-server:8080/v1
+API Key: [optional]
+```
+
+### Important Notes
+
+- Self-hosted embeddings **do not** fall back to `api.openai.com` if misconfigured
+- Adapter returns 400 with reason instead of silently failing
+- Upstream fetch bounded by `FETCH_CONNECT_TIMEOUT_MS` to prevent hanging
+
+---
+
+## Fish Audio TTS
+
+Text-to-speech provider with voice cloning support (added in v0.5.55).
+
+### How It Works
+
+- **Model ID**: Sent in HTTP `model` header
+- **Voice**: Specified as `reference_id` (preset or cloned voice model)
+- **Cloning**: Upload reference audio to create custom voices
+
+### Use Cases
+
+- Custom voice personas for AI assistants
+- Multilingual TTS with natural prosody
+- Voice cloning for accessibility
+
+### Configuration
+
+Add Fish Audio connection in Dashboard → Providers → Fish Audio:
+- API Key: Your Fish Audio API key
+- Model: Select from available models
+- Voice: Choose preset or cloned voice
+
+---
+
+## Vision & Audio Capacity Adapter
+
+Automatic routing to vision/audio-capable models when target lacks capability (added in v0.5.50).
+
+### How It Works
+
+When a request contains images or audio but the target model doesn't support them:
+
+1. Adapter detects multimodal content
+2. Checks target model capabilities
+3. Auto-switches to vision/audio-capable model
+4. Falls back to `oc/mimo-v2.5-free` if no suitable model found
+
+### Detection
+
+Detects images from:
+- Hermes payloads
+- `images[]` array
+- `experimental_attachments`
+- Message-level `image_url` / `audio_url`
+- Inline `data:` URIs
+- Vercel AI SDK shapes
+
+### Configuration
+
+Default-enabled in v0.5.50. No manual configuration needed.
+
+---
+
+## TokenRouter Provider
+
+300+ models via OpenAI-compatible gateway (added in v0.5.50).
+
+### Features
+
+- **110 Models**: Exact per-model pricing for 110 models
+- **Reasoning Effort**: `reasoning_effort` thinking config support
+- **OpenAI-Compatible**: Works with any OpenAI-compatible client
+
+### Use Cases
+
+- Access multiple models through single provider
+- Simplified billing and quota management
+- Fallback chain across many models
+
+### Configuration
+
+Add TokenRouter connection in Dashboard → Providers → TokenRouter:
+- API Key: Your TokenRouter API key
+- Models: Browse available models in dashboard
+
+---
+
+## Default Key Auto-Provisioning
+
+First-time users automatically get a "Default Key" (added in v0.5.50).
+
+### How It Works
+
+When 9Router starts for the first time:
+
+1. System generates a default API key
+2. Key is stored in local database
+3. `/v1` endpoint works immediately without manual dashboard setup
+4. Key appears in Dashboard → API Keys
+
+### Benefits
+
+- **Zero-config start**: New users can test immediately
+- **Simplified onboarding**: No need to navigate dashboard first
+- **Backward compatible**: Existing setups unaffected
+
+---
+
+## New Providers & Models
+
+### v0.5.55 Additions
+
+| Provider/Model | Notes |
+|----------------|-------|
+| **Alibaba Token Plan** | Singapore-only, OpenAI-compatible, 4th Alibaba key type |
+| **GLM-5.3** | Added to GLM Coding and GLM (China) |
+| **Gemini 3.7 Flash** | Tiered variants (high/medium/low) in Antigravity + Gemini registry |
+| **Fish Audio** | TTS provider with voice cloning |
+| **Claude Opus 5** | Default Opus model bumped in v0.5.45 |
+
+### v0.5.50 Additions
+
+| Provider/Model | Notes |
+|----------------|-------|
+| **TokenRouter** | 300+ models, 110 with exact pricing |
+| **Self-hosted STT/TTS/Embedding** | whisper.cpp, faster-whisper, Kokoro, llama-server, vLLM, Infinity |
+| **OpenDesign** | CLI tool support (manalkaff/opendesign) |
+
+### v0.5.45 Additions
+
+| Provider/Model | Notes |
+|----------------|-------|
+| **Poolside** | OpenAI-compatible |
+| **api-airforce, baidu, bazaarlink, bluesminds, kilo-gateway, llm7, morph, sambanova, tencent** | API key providers |
+| **Zed / Trae / Windsurf** | OAuth callback proxies |
+| **Gemini 3.6 Flash** | Tier routing |
+| **Gemini 3.5 Flash Lite** | Lightweight model |
+| **Claude Opus 5** | Default Opus model |
+| **Kiro Claude Opus 5** | Opus 5 models in Kiro |
+
+---
+
+## Claude Quota Cache
+
+Deduplication and caching for Claude quota calls (added in v0.5.55).
+
+### Problem
+
+Multiple dashboard tabs making simultaneous quota requests could trigger 429 rate limits from Anthropic.
+
+### Solution
+
+- **120s TTL Cache**: Keyed by access token
+- **In-flight Promise Dedup**: Concurrent requests share same promise
+- **Last-good Read**: Soft failures return cached value instead of error
+- **Manual Refresh**: Click ↻ button sends `force=1` to bypass cache
+
+### Benefits
+
+- No more 429 errors from multiple tabs
+- Faster dashboard load (cached responses)
+- Graceful degradation on network issues
+
+---
+
+## Security Updates (v0.5.55)
+
+### Critical: Real IP Bypass (GHSA-pjm4-8fpg-f9p6)
+
+**Vulnerability**: `x-9r-real-ip` and Host fallback headers were trusted from client-controlled headers when `custom-server.js` was not in the request path (`npm run start`, `start:bun`), allowing remote callers to pose as local and skip API key auth.
+
+**Impact**: Could reach `LOCAL_ONLY_PATHS` (`/api/mcp/*`, `/api/tunnel/enable`, `/api/auth/reset-password`) without authentication.
+
+**Fix**: 
+- Server now stamps per-process `x-9r-peer-token` on every sanitized request
+- Only trusts `x-9r-real-ip` behind peer token
+- Falls back to Host in development, fails closed in production
+- Fixed IPv6 loopback detection (`::1`, `::ffff:127.0.0.1`)
+- Routes `npm run start` / `start:bun` through `custom-server.js`
+
+**Action Required**: **Upgrade immediately if 9Router is exposed to network!**
+
+### SSRF Guard
+
+`resolveBaseUrl()` now rejects client-supplied non-public baseUrls on `/v1/search` endpoint.
+
+### Login Security
+
+Fresh-install remote login with default password now returns 403 without issuing JWT.
+
+### Usage Redaction
+
+`/api/usage/request-details` now redacts request/response payloads to prevent sensitive data exposure.
+
+---
+
 ## Related Documentation
 
 - [`README.md`](./README.md) — Main project overview and quick start.
@@ -552,4 +820,4 @@ You only pay:
 
 ---
 
-*This guide reflects 9Router v0.5.45. Features and provider availability may change in future releases.*
+*This guide reflects 9Router v0.5.55. Features and provider availability may change in future releases.*
