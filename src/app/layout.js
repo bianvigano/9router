@@ -56,7 +56,12 @@ export default async function RootLayout({ children }) {
       <body className={`${inter.variable} font-sans antialiased`}>
         <ThemeProvider>
           <RuntimeI18nProvider>
-            <DynamicBranding {...brandingProps} />
+            {/* Pass server-side fetched displayName to DynamicBranding */}
+            <DynamicBranding 
+              displayName={brandingProps.displayName}
+              faviconEmoji={brandingProps.faviconEmoji}
+              faviconDataUrl={brandingProps.faviconDataUrl}
+            />
             {children}
           </RuntimeI18nProvider>
         </ThemeProvider>
