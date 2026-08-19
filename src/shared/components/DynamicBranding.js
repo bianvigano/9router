@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
+
+const BRANDING_STORAGE_KEY = "9router_branding_v1";
 
 function escapeXml(str) {
-  return str
+  return String(str || "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -17,25 +19,36 @@ function makeFaviconSvg(emoji) {
 }
 
 export default function DynamicBranding({ displayName: initialName = "", faviconEmoji: initialEmoji = "", faviconDataUrl: initialDataUrl = "" }) {
-  const [state, setState] = useState({
-    displayName: initialName,
-    faviconEmoji: initialEmoji,
-    faviconDataUrl: initialDataUrl,
+  // State with hydration support
+  const [state, setState] = useState(() => {
+    // Try to restore from localStorage first (survives reload)
+    if (typeof window === "undefined") return {};
+    
+    try {
+      const saved = localStorage.getItem(BRANDING_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed.displayName && typeof parsed.displayName === "string") {
+          return parsed;
+        }
+      }
+    } catch {}
+    
+    // Fallback to server-provided props
+    return {
+      displayName: initialName || "",
+      faviconEmoji: initialEmoji || "",
+      faviconDataUrl: initialDataUrl || "",
+    };
   });
 
-  // Listen for settings-updated events from Profile page
-  useEffect(() => {
-    const handler = (e) => {
-      const { displayName, faviconEmoji, faviconDataUrl } = e.detail || {};
-      setState({
-        displayName: displayName ?? state.displayName,
-        faviconEmoji: faviconEmoji ?? state.faviconEmoji,
-        faviconDataUrl: faviconDataUrl ?? state.faviconDataUrl,
-      });
-    };
-    window.addEventListener("9router:settings-updated", handler);
-    return () => window.removeEventListener("9router:settings-updated", handler);
-  }, [state]);
+  const saveToStorage = useCallback((newState) => {
+    try {
+      if (typeof window !== "undefined") {
+        localStorage.setItem(BRANDING_STORAGE_KEY, JSON.stringify(newState));
+      }
+    } catch {}
+  }, []);
 
   // Apply title & favicon to DOM
   useEffect(() => {
@@ -45,7 +58,7 @@ export default function DynamicBranding({ displayName: initialName = "", favicon
     // Update document title
     const baseTitle = "9Router - AI Infrastructure Management";
     if (displayName && typeof displayName === "string" && displayName.trim()) {
-      document.title = `${displayName.trim()} | 9Router`;
+      document.title = `${displayName.trim()} | ${baseTitle}`;
     } else {
       document.title = baseTitle;
     }
@@ -67,8 +80,27 @@ export default function DynamicBranding({ displayName: initialName = "", favicon
       }
       link.href = iconHref;
       link.type = iconHref.startsWith("data:image/svg") ? "image/svg+xml" : "";
+      
+      // Save to localStorage immediately after first load
+      saveToStorage(state);
     }
-  }, [state]);
+  }, [state, saveToStorage]);
+
+  // Listen for settings-updated events from Profile page
+  useEffect(() => {
+    const handler = (e) => {
+      const newState = { ...state };
+      const { displayName, faviconEmoji, faviconDataUrl } = e.detail || {};
+      if (displayName !== undefined) newState.displayName = displayName;
+      if (faviconEmoji !== undefined) newState.faviconEmoji = faviconEmoji;
+      if (faviconDataUrl !== undefined) newState.faviconDataUrl = faviconDataUrl;
+      
+      setState(newState);
+      saveToStorage(newState); // Persist to localStorage
+    };
+    window.addEventListener("9router:settings-updated", handler);
+    return () => window.removeEventListener("9router:settings-updated", handler);
+  }, [state, saveToStorage]);
 
   return null;
 }
