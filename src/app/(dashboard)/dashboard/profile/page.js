@@ -81,6 +81,17 @@ export default function ProfilePage() {
   const [proxyLoading, setProxyLoading] = useState(false);
   const [proxyTestLoading, setProxyTestLoading] = useState(false);
 
+  // Personalization (display name + tab icon)
+  const [brandingForm, setBrandingForm] = useState({
+    displayName: "",
+    faviconEmoji: "",
+    faviconDataUrl: "",
+  });
+  const [brandingStatus, setBrandingStatus] = useState({ type: "", message: "" });
+  const [brandingLoading, setBrandingLoading] = useState(false);
+  const iconFileRef = useRef(null);
+  const [iconPreview, setIconPreview] = useState("");
+
   useEffect(() => {
     fetch("/api/settings")
       .then((res) => res.json())
@@ -116,6 +127,12 @@ export default function ProfilePage() {
           outboundProxyUrl: data?.outboundProxyUrl || "",
           outboundNoProxy: data?.outboundNoProxy || "",
         });
+        setBrandingForm({
+          displayName: data?.displayName || "",
+          faviconEmoji: data?.faviconEmoji || "",
+          faviconDataUrl: data?.faviconDataUrl || "",
+        });
+        setIconPreview(data?.faviconDataUrl || data?.faviconEmoji || "");
         setLoading(false);
       })
       .catch((err) => {
@@ -191,6 +208,86 @@ export default function ProfilePage() {
       setProxyTestLoading(false);
     }
   };
+
+  // --- Personalization handlers (display name + tab icon) ---
+  const saveBranding = async (e) => {
+    e.preventDefault();
+    setBrandingLoading(true);
+    setBrandingStatus({ type: "", message: "" });
+
+    try {
+      const res = await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          displayName: brandingForm.displayName.trim(),
+          faviconEmoji: brandingForm.faviconEmoji.trim(),
+          faviconDataUrl: brandingForm.faviconDataUrl,
+        }),
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        setSettings((prev) => ({ ...prev, ...data }));
+        setBrandingStatus({ type: "success", message: "Profile & tab settings saved" });
+        // Notify DynamicBranding (global title + favicon) for live update
+        window.dispatchEvent(
+          new CustomEvent("9router:settings-updated", {
+            detail: {
+              displayName: data.displayName || "",
+              faviconEmoji: data.faviconEmoji || "",
+              faviconDataUrl: data.faviconDataUrl || "",
+            },
+          })
+        );
+      } else {
+        setBrandingStatus({ type: "error", message: data.error || "Failed to save settings" });
+      }
+    } catch (err) {
+      setBrandingStatus({ type: "error", message: "An error occurred" });
+    } finally {
+      setBrandingLoading(false);
+    }
+  };
+
+  const handleIconFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    // Only images, max ~500KB
+    if (!file.type.startsWith("image/")) {
+      setBrandingStatus({ type: "error", message: "Please choose an image file" });
+      return;
+    }
+    if (file.size > 500 * 1024) {
+      setBrandingStatus({ type: "error", message: "Image too large (max 500KB)" });
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result);
+      setBrandingForm((prev) => ({ ...prev, faviconDataUrl: dataUrl, faviconEmoji: "" }));
+      setIconPreview(dataUrl);
+      setBrandingStatus({ type: "", message: "" });
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleEmojiPick = (emoji) => {
+    setBrandingForm((prev) => ({ ...prev, faviconEmoji: emoji, faviconDataUrl: "" }));
+    setIconPreview(emoji);
+    setBrandingStatus({ type: "", message: "" });
+  };
+
+  const clearIcon = () => {
+    setBrandingForm((prev) => ({ ...prev, faviconEmoji: "", faviconDataUrl: "" }));
+    setIconPreview("");
+    setBrandingStatus({ type: "", message: "" });
+  };
+
+  const EMOJI_PRESETS = [
+    "🚀", "🤖", "🧠", "⚡", "🔥", "🎯", "🛡️", "💎",
+    "🌐", "🧩", "🛠️", "📡", "💻", "✨", "🧪", "🔮",
+  ];
 
   const updateOutboundProxyEnabled = async (outboundProxyEnabled) => {
     setProxyLoading(true);
@@ -851,6 +948,149 @@ export default function ProfilePage() {
             <span className="text-sm text-text-muted">Display language</span>
             <span className="text-2xl">{LOCALE_FLAGS[locale] || "🌐"}</span>
           </button>
+        </Card>
+
+        {/* Personalization (display name + tab icon) */}
+        <Card>
+          <form onSubmit={saveBranding} className="flex flex-col gap-4">
+            <div className="flex items-center gap-3">
+              <div className="size-10 rounded-lg bg-purple-500/10 text-purple-500 flex items-center justify-center shrink-0">
+                <span className="material-symbols-outlined text-[20px]">badge</span>
+              </div>
+              <div>
+                <h3 className="text-base sm:text-lg font-semibold">Personalization</h3>
+                <p className="text-xs sm:text-sm text-text-muted">
+                  Customize the browser tab name and icon
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <label className="text-sm font-medium">Display name</label>
+              <Input
+                value={brandingForm.displayName}
+                onChange={(e) =>
+                  setBrandingForm((prev) => ({ ...prev, displayName: e.target.value }))
+                }
+                placeholder="9Router"
+                maxLength={40}
+                icon="person"
+              />
+              <p className="text-xs text-text-muted">
+                Shown in the browser tab title. Leave empty to use the default.
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-2 pt-4 border-t border-border/50">
+              <label className="text-sm font-medium">Tab icon</label>
+              <p className="text-xs text-text-muted">
+                Pick an emoji or upload an image (PNG/JPG/ICO/SVG, max 500KB).
+              </p>
+
+              <div className="flex items-center gap-3">
+                <div
+                  className="size-14 sm:size-16 rounded-lg bg-bg border border-border flex items-center justify-center overflow-hidden shrink-0"
+                  aria-label="Icon preview"
+                >
+                  {iconPreview ? (
+                    iconPreview.startsWith("data:") ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={iconPreview}
+                        alt="Custom tab icon"
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      <span className="text-3xl sm:text-4xl leading-none">
+                        {iconPreview}
+                      </span>
+                    )
+                  ) : (
+                    <span className="material-symbols-outlined text-2xl text-text-muted">
+                      image
+                    </span>
+                  )}
+                </div>
+                <div className="flex flex-col gap-2 flex-1 min-w-0">
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      icon="upload"
+                      onClick={() => iconFileRef.current?.click()}
+                    >
+                      Upload image
+                    </Button>
+                    {iconPreview && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        icon="close"
+                        onClick={clearIcon}
+                      >
+                        Clear
+                      </Button>
+                    )}
+                  </div>
+                  <input
+                    ref={iconFileRef}
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={handleIconFile}
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <p className="text-xs text-text-muted">Quick picks</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {EMOJI_PRESETS.map((emoji) => {
+                    const isActive =
+                      !brandingForm.faviconDataUrl && brandingForm.faviconEmoji === emoji;
+                    return (
+                      <button
+                        key={emoji}
+                        type="button"
+                        onClick={() => handleEmojiPick(emoji)}
+                        className={cn(
+                          "size-9 sm:size-10 rounded-md flex items-center justify-center text-xl sm:text-2xl border transition-colors",
+                          isActive
+                            ? "border-primary bg-primary/10"
+                            : "border-border bg-bg hover:border-primary/50"
+                        )}
+                        aria-label={`Use ${emoji} as tab icon`}
+                      >
+                        {emoji}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {brandingStatus.message && (
+              <p
+                className={`text-sm ${brandingStatus.type === "error" ? "text-red-500" : "text-green-600 dark:text-green-400"}`}
+              >
+                {brandingStatus.message}
+              </p>
+            )}
+
+            <div className="flex justify-end pt-2 border-t border-border/50">
+              <Button
+                type="submit"
+                variant="primary"
+                icon="save"
+                loading={brandingLoading}
+                disabled={loading}
+              >
+                Save personalization
+              </Button>
+            </div>
+          </form>
         </Card>
 
         {/* Security */}

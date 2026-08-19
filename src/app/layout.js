@@ -3,6 +3,7 @@ import { GoogleAnalytics } from "@next/third-parties/google";
 import "material-symbols/outlined.css";
 import "./globals.css";
 import { ThemeProvider } from "@/shared/components/ThemeProvider";
+import DynamicBranding from "@/shared/components/DynamicBranding";
 import "@/lib/network/initOutboundProxy"; // Auto-initialize outbound proxy env
 import "@/shared/services/bootstrap"; // Auto-run initializeApp (watchdog, auto-resume tunnel)
 import { initConsoleLogCapture } from "@/lib/consoleLogBuffer";
@@ -28,7 +29,21 @@ export const viewport = {
   themeColor: "#0a0a0a",
 };
 
-export default function RootLayout({ children }) {
+export default async function RootLayout({ children }) {
+  // Fetch settings server-side for initial dynamic branding
+  let brandingProps = { displayName: "", faviconEmoji: "", faviconDataUrl: "" };
+  try {
+    const { getSettings } = await import("@/lib/localDb");
+    const settings = await getSettings();
+    brandingProps = {
+      displayName: settings.displayName || "",
+      faviconEmoji: settings.faviconEmoji || "",
+      faviconDataUrl: settings.faviconDataUrl || "",
+    };
+  } catch {
+    // Fail open — use defaults
+  }
+
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
@@ -41,6 +56,7 @@ export default function RootLayout({ children }) {
       <body className={`${inter.variable} font-sans antialiased`}>
         <ThemeProvider>
           <RuntimeI18nProvider>
+            <DynamicBranding {...brandingProps} />
             {children}
           </RuntimeI18nProvider>
         </ThemeProvider>
